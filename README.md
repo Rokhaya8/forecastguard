@@ -135,7 +135,7 @@ Make sure the following tools are installed:
 ### 1. Clone the repository
 
 ```bash
-git clone <repository-url>
+git clone <https://github.com/Rokhaya8/forecastguard.git>
 cd forecastguard
 ```
 
