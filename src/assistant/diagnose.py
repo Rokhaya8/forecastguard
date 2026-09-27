@@ -1,11 +1,13 @@
 import os
-import time 
+import time
 
-import psycopg
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors
+
+from src.quality.volume_check import evaluate_volume
 from src.storage.runs import save_run
+
 
 load_dotenv()
 
@@ -13,91 +15,23 @@ MODEL_NAME = "gemini-3.6-flash"
 MAX_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 20
 
-def get_connection():
-    return psycopg.connect(
-        host=os.getenv("POSTGRES_HOST"),
-        port=os.getenv("POSTGRES_PORT"),
-        dbname=os.getenv("POSTGRES_DB"),
-        user=os.getenv("POSTGRES_USER"),
-        password=os.getenv("POSTGRES_PASSWORD"),
-    )
 
-
-def get_latest_quality_context(connection):
-    query = """
-        WITH daily_sales AS (
-            SELECT
-                order_date,
-                number_of_orders
-            FROM analytics.fct_daily_sales
-        ),
-        latest_day AS (
-            SELECT MAX(order_date) AS latest_date
-            FROM daily_sales
-        )
-        SELECT
-            latest.order_date,
-            latest.number_of_orders,
-            AVG(history.number_of_orders) AS historical_average
-        FROM daily_sales latest
-        CROSS JOIN latest_day
-        JOIN daily_sales history
-            ON history.order_date < latest_day.latest_date
-           AND history.order_date >= latest_day.latest_date - INTERVAL '7 days'
-        WHERE latest.order_date = latest_day.latest_date
-        GROUP BY
-            latest.order_date,
-            latest.number_of_orders;
-    """
-
-    with connection.cursor() as cursor:
-        cursor.execute(query)
-        return cursor.fetchone()
-
-
-def build_diagnostic_context():
-    with get_connection() as connection:
-        result = get_latest_quality_context(connection)
-
-    if result is None:
-        raise RuntimeError("Not enough data to build diagnostic context.")
-
-    order_date, current_volume, historical_average = result
-    historical_average = float(historical_average)
-    volume_ratio = current_volume / historical_average
-
-    return {
-        "pipeline": "ForecastGuard",
-        "dbt_run": os.getenv("DBT_RUN_STATUS", "UNKNOWN"),
-        "dbt_test": os.getenv("DBT_TEST_STATUS", "UNKNOWN"),
-        "latest_date": order_date,
-        "current_orders": current_volume,
-        "historical_average_7d": round(historical_average, 2),
-        "volume_ratio": round(volume_ratio, 4),
-        "quality_check": os.getenv(
-            "QUALITY_CHECK_STATUS",
-            "FAILED" if volume_ratio < 0.70 else "PASSED"
-      ),
-        "forecast_status": "BLOCKED" if volume_ratio < 0.70 else "READY",
-    }
-
-
-def build_prompt(context):
+def build_prompt(metrics):
     return f"""
 You are a data reliability assistant.
 
 Analyze only the evidence provided below.
 
 Pipeline context:
-- Pipeline: {context["pipeline"]}
-- dbt run: {context["dbt_run"]}
-- dbt test: {context["dbt_test"]}
-- Latest date: {context["latest_date"]}
-- Current orders: {context["current_orders"]}
-- 7-day historical average: {context["historical_average_7d"]}
-- Volume ratio: {context["volume_ratio"]:.2%}
-- Quality check: {context["quality_check"]}
-- Forecast status: {context["forecast_status"]}
+- Pipeline: ForecastGuard
+- dbt transformations: completed successfully
+- dbt structural tests (not_null, unique on order_id): passed
+- Volume quality check: anomaly detected
+- Forecast status: BLOCKED
+- Latest date: {metrics["data_date"]}
+- Current orders: {metrics["current_orders"]}
+- 7-day historical average: {metrics["historical_average"]}
+- Volume ratio: {metrics["volume_ratio"]:.2%}
 
 Available data fields:
 - order_id
@@ -123,7 +57,7 @@ Instructions:
 """
 
 
-def get_llm_diagnosis(context):
+def get_llm_diagnosis(metrics):
     api_key = os.getenv("GEMINI_API_KEY")
 
     if not api_key:
@@ -135,7 +69,7 @@ def get_llm_diagnosis(context):
         try:
             response = client.models.generate_content(
                 model=MODEL_NAME,
-                contents=build_prompt(context),
+                contents=build_prompt(metrics),
             )
             return response.text
 
@@ -150,19 +84,19 @@ def get_llm_diagnosis(context):
 
     return None
 
+
 def main():
-    context = build_diagnostic_context()
+    metrics = evaluate_volume()
 
-    print("Diagnostic context")
-    print("------------------")
-
-    for key, value in context.items():
-        print(f"{key}: {value}")
+    if metrics["passed"]:
+        print("No volume anomaly detected: nothing to diagnose.")
+        return
 
     print("\nLLM diagnosis")
     print("-------------")
 
-    diagnosis = get_llm_diagnosis(context)
+    diagnosis = get_llm_diagnosis(metrics)
+
     if diagnosis is None:
         print(
             "Diagnosis unavailable: Gemini did not respond. "
@@ -172,10 +106,10 @@ def main():
         print(diagnosis)
 
     save_run(
-        data_date=context["latest_date"],
-        current_orders=context["current_orders"],
-        historical_average=context["historical_average_7d"],
-        volume_ratio=context["volume_ratio"],
+        data_date=metrics["data_date"],
+        current_orders=metrics["current_orders"],
+        historical_average=metrics["historical_average"],
+        volume_ratio=metrics["volume_ratio"],
         status="BLOCKED",
         diagnosis=diagnosis,
     )

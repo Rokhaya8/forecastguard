@@ -51,7 +51,7 @@ def get_volume_metrics(connection):
         return cursor.fetchone()
 
 
-def check_volume():
+def evaluate_volume():
     with get_connection() as connection:
         result = get_volume_metrics(connection)
 
@@ -62,28 +62,38 @@ def check_volume():
     historical_average = float(historical_average)
 
     ratio = current_volume / historical_average
+    passed = ratio >= THRESHOLD
 
     print(f"Date: {order_date}")
     print(f"Current volume: {current_volume}")
     print(f"7-day average: {historical_average:.2f}")
     print(f"Volume ratio: {ratio:.2%}")
 
-    if ratio < THRESHOLD:
-        raise RuntimeError(
+    if passed:
+        print("Volume check passed.")
+    else:
+        print(
             f"Volume anomaly detected: {current_volume} orders "
             f"vs {historical_average:.2f} historical average."
         )
 
-    print("Volume check passed.")
-    
     return {
         "data_date": order_date,
         "current_orders": current_volume,
         "historical_average": round(historical_average, 2),
         "volume_ratio": round(ratio, 4),
+        "passed": passed,
     }
+
+
+def check_volume():
+    metrics = evaluate_volume()
+
+    if not metrics["passed"]:
+        raise RuntimeError("Volume check failed: forecast must not be produced.")
+
+    return metrics
 
 
 if __name__ == "__main__":
     check_volume()
-    
