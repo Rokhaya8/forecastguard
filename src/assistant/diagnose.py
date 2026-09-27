@@ -1,11 +1,17 @@
 import os
+import time 
 
 import psycopg
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors
+from src.storage.runs import save_run
 
 load_dotenv()
 
+MODEL_NAME = "gemini-3.6-flash"
+MAX_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 20
 
 def get_connection():
     return psycopg.connect(
@@ -64,7 +70,7 @@ def build_diagnostic_context():
         "pipeline": "ForecastGuard",
         "dbt_run": os.getenv("DBT_RUN_STATUS", "UNKNOWN"),
         "dbt_test": os.getenv("DBT_TEST_STATUS", "UNKNOWN"),
-        "latest_date": str(order_date),
+        "latest_date": order_date,
         "current_orders": current_volume,
         "historical_average_7d": round(historical_average, 2),
         "volume_ratio": round(volume_ratio, 4),
@@ -125,13 +131,24 @@ def get_llm_diagnosis(context):
 
     client = genai.Client(api_key=api_key)
 
-    response = client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=build_prompt(context),
-    )
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=build_prompt(context),
+            )
+            return response.text
 
-    return response.text
+        except errors.APIError as error:
+            print(
+                f"Gemini call failed (attempt {attempt}/{MAX_ATTEMPTS}): "
+                f"{error.code} {error.message}"
+            )
 
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_DELAY_SECONDS)
+
+    return None
 
 def main():
     context = build_diagnostic_context()
@@ -146,7 +163,22 @@ def main():
     print("-------------")
 
     diagnosis = get_llm_diagnosis(context)
-    print(diagnosis)
+    if diagnosis is None:
+        print(
+            "Diagnosis unavailable: Gemini did not respond. "
+            "The incident details above remain valid."
+        )
+    else:
+        print(diagnosis)
+
+    save_run(
+        data_date=context["latest_date"],
+        current_orders=context["current_orders"],
+        historical_average=context["historical_average_7d"],
+        volume_ratio=context["volume_ratio"],
+        status="BLOCKED",
+        diagnosis=diagnosis,
+    )
 
 
 if __name__ == "__main__":

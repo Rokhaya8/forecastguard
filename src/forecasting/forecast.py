@@ -5,6 +5,7 @@ import psycopg
 from dotenv import load_dotenv
 
 from src.quality.volume_check import check_volume
+from src.storage.runs import save_run
 
 
 load_dotenv()
@@ -43,7 +44,7 @@ def generate_forecast():
     print("Running data quality check...")
 
     # If this raises an exception, forecasting stops here.
-    check_volume()
+    metrics = check_volume()
 
     print("Data quality check passed.")
     print("Generating forecast...")
@@ -70,6 +71,16 @@ def generate_forecast():
     print(f"Forecast date: {forecast_date}")
     print(f"Forecast window: {FORECAST_WINDOW} days")
     print(f"Predicted orders: {predicted_orders:.0f}")
+
+    save_run(
+        data_date=metrics["data_date"],
+        current_orders=metrics["current_orders"],
+        historical_average=metrics["historical_average"],
+        volume_ratio=metrics["volume_ratio"],
+        status="PUBLISHED",
+        forecast_date=forecast_date,
+        predicted_orders=round(predicted_orders),
+    )
 
     return {
         "forecast_date": forecast_date,

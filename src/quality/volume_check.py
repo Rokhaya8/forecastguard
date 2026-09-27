@@ -75,6 +75,13 @@ def check_volume():
         )
 
     print("Volume check passed.")
+    
+    return {
+        "data_date": order_date,
+        "current_orders": current_volume,
+        "historical_average": round(historical_average, 2),
+        "volume_ratio": round(ratio, 4),
+    }
 
 
 if __name__ == "__main__":
