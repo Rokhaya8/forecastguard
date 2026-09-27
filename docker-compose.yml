@@ -52,5 +52,32 @@ services:
       - .:/opt/airflow/forecastguard
 
     command: airflow standalone
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+
+    container_name: forecastguard-dashboard
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      PYTHONPATH: /app
+
+    ports:
+      - "8501:8501"
+
+    volumes:
+      - .:/app
+
+    command: streamlit run dashboard/app.py --server.address 0.0.0.0 --server.port 8501
 volumes:
   postgres_data:

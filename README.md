@@ -1,283 +1,264 @@
 # ForecastGuard
 
-**Reliable Sales Forecasting Pipeline**
+**A sales forecasting pipeline that refuses to publish a forecast built on unreliable data.**
 
-ForecastGuard is an end-to-end data pipeline designed to ensure that a
-forecasting model only runs when the data feeding it is reliable.
+ForecastGuard checks the data feeding a forecast before the forecast is
+produced. When the data looks normal, the forecast is published. When it
+doesn't, the forecast is blocked, the incident is recorded, and an LLM
+assistant explains what may have gone wrong and what to check.
 
-A forecasting model can execute successfully while still producing unreliable
-predictions if upstream data is incomplete or inconsistent. ForecastGuard
-addresses this problem by validating transformed sales data before allowing
-the forecasting step to run.
+## The problem
 
-When a data quality anomaly is detected, the forecast is blocked and an LLM
-assistant analyzes the available pipeline context to explain the anomaly and
-suggest relevant investigation steps.
+A forecasting pipeline can run without a single error and still produce a
+wrong number.
+
+Imagine a retailer that uses a daily sales forecast to decide how much stock
+to order. One morning, only part of the previous day's orders reach the
+database: an export failed, or a source arrived late. Every step of the
+pipeline still succeeds. The model sees a sharp drop in sales, predicts a
+weak day, and the purchasing team orders less. Two weeks later, the shelves
+are empty.
+
+Nothing crashed, so nobody noticed. That is the dangerous case: a wrong
+forecast presented as a correct one is worse than no forecast at all.
+
+Classic data tests do not catch this. They check the **shape** of the data
+(no missing values, no duplicate orders), not whether there is **enough** of
+it. A partially loaded day passes every structural test.
+
+## What ForecastGuard does
+
+1. **Loads and transforms the sales data**, then runs structural tests.
+2. **Checks the volume of the latest day** against the average of the 7
+   previous days. Below 70%, the data is considered unreliable.
+3. **Decides what happens next:**
+   - volume is normal → the forecast is produced and published;
+   - volume is abnormal → the forecast is blocked and the incident is
+     diagnosed.
+4. **Records every decision** in a `forecast_runs` table: what data was
+   checked, the figures, the decision, and the forecast or the diagnosis.
+5. **Shows the result in a dashboard** answering one question: can today's
+   forecast be trusted, and if not, why?
+
+When a forecast is blocked, the LLM assistant (Gemini) receives the figures
+of the incident and returns a short diagnosis that separates observed facts
+from hypotheses, and recommends checks based only on the data that exists.
+It proposes; a human decides.
+
+## Why I built it
+
+While working on sales forecasting with LSTM models, I studied how the
+volume of training data affected the reliability of the predictions. The
+main lesson was that the model was rarely the weak point: the data feeding
+it was.
+
+ForecastGuard is built around that lesson. The forecasting model is
+intentionally simple (a 7-day moving average), because the project is not
+about predicting better. It is about making sure a prediction deserves to be
+trusted before anyone acts on it.
 
 ## Architecture
 
 ```text
-Synthetic Orders
-      |
-      v
-   Airflow
-      |
-      v
- PostgreSQL
-      |
-      v
-     dbt
-      |
-      v
-Data Quality Check
-    /       \
- PASS       FAIL
-  |           |
-  v           v
-Forecast    LLM Assistant
+Synthetic orders (CSV)
+        │
+        ▼
+  ingest_orders ──► PostgreSQL (raw_orders)
+        │
+        ▼
+     dbt run ──────► stg_orders, fct_daily_sales
+        │
+        ▼
+     dbt test        structural tests (not null, unique)
+        │
+        ▼
+  quality_check      volume vs. 7-day average
+     /      \
+ normal    abnormal
+   │          │
+   ▼          ▼
+forecast   assistant_diagnosis (Gemini)
+   │          │
+   └────┬─────┘
+        ▼
+  forecast_runs table ──► Streamlit dashboard
 ```
 
-## Tech Stack
+The whole pipeline is orchestrated by Airflow. `quality_check` is a branch:
+it measures the data, then chooses the next task itself. A blocked forecast
+is therefore a **successful** pipeline run, because the system did its job.
+Only a real technical failure (database unreachable, broken transformation)
+appears as a failed run in Airflow.
 
-- **Python** — ingestion, data quality, forecasting and anomaly simulation
-- **Apache Airflow** — pipeline orchestration
-- **PostgreSQL** — data storage
-- **dbt Core** — SQL transformations and structural data tests
-- **Gemini API** — contextual anomaly explanation
-- **Docker** — reproducible local infrastructure
+## Tech stack
 
-## Data Quality Scenario
+- **Python**: ingestion, volume check, forecast, diagnosis, data simulation
+- **Apache Airflow**: orchestration and branching
+- **PostgreSQL**: storage of raw data, models and run history
+- **dbt Core**: SQL transformations and structural tests
+- **Gemini API**: incident diagnosis
+- **Streamlit**: monitoring dashboard
+- **Docker Compose**: the full stack starts with one command
 
-ForecastGuard includes a simulated low-volume anomaly to demonstrate how the
-pipeline reacts to unreliable input data.
-
-Under normal conditions, the synthetic dataset contains approximately
-900–1,100 orders per day. The pipeline compares the latest daily order volume
-with the average volume of the previous seven days.
-
-For the anomaly scenario, only **150 orders** are generated for a new day,
-while the previous 7-day average is approximately **1,040 orders**.
-
-```text
-Latest daily volume : 150 orders
-7-day average       : ~1,040 orders
-Volume ratio        : ~14.4%
-Quality threshold   : 70%
-```
-
-Because the volume ratio falls below the quality threshold:
-
-```text
-dbt tests            → PASSED
-volume quality check → FAILED
-forecast             → BLOCKED
-LLM diagnosis        → TRIGGERED
-```
-
-This illustrates an important distinction: structural tests can pass while the
-data is still unsuitable for downstream analytical or ML workloads.
-
-## How It Works
-
-The pipeline is orchestrated by Airflow and follows a sequence of validation
-steps before producing a forecast.
-
-### 1. Data Ingestion
-
-A Python script generates synthetic sales orders and loads them into the
-`raw_orders` table in PostgreSQL.
-
-### 2. Data Transformation
-
-dbt transforms the raw data into analytical models:
-
-- `stg_orders` enriches individual orders with calculated sales amounts.
-- `fct_daily_sales` aggregates orders into daily sales metrics.
-
-dbt tests validate structural properties such as non-null values and unique
-order identifiers.
-
-### 3. Data Quality Gate
-
-A Python quality check compares the latest order volume with the previous
-7-day average.
-
-If the volume is above the defined threshold, the pipeline continues.
-If it falls below the threshold, the quality task fails.
-
-### 4. Forecasting
-
-When data quality checks pass, ForecastGuard generates a simple 7-day
-moving-average forecast for the next day's order volume.
-
-The forecasting method is intentionally simple: the focus of the project is
-the reliability of the data pipeline feeding the model.
-
-### 5. LLM-Assisted Diagnosis
-
-When the volume quality check fails, the forecasting task is blocked and an
-LLM assistant is triggered.
-
-The assistant receives the available pipeline and quality context, separates
-observed facts from plausible hypotheses, and recommends investigation steps
-based only on the available data.
-
-## Run Locally
+## Run it locally
 
 ### Prerequisites
-
-Make sure the following tools are installed:
 
 - Docker Desktop
 - Python 3.10+
 - Git
+- A free Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
 
 ### 1. Clone the repository
 
 ```bash
-git clone <https://github.com/Rokhaya8/forecastguard.git>
+git clone https://github.com/Rokhaya8/forecastguard.git
 cd forecastguard
 ```
 
-### 2. Configure environment variables
+### 2. Configure the environment
 
-Create a `.env` file based on `.env.example`.
-
-On Windows PowerShell:
+Create a `.env` file from the template:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Then add your own Gemini API key to `.env`.
+Then replace `GEMINI_API_KEY` in `.env` with your own key. The other values
+can stay as they are.
 
-> Never commit the `.env` file. It is excluded through `.gitignore`.
+> The `.env` file is excluded by `.gitignore`. Never commit it.
 
-### 3. Install local Python dependencies
+### 3. Install the local Python dependencies
 
-Create a virtual environment:
-
-```bash
-python -m venv .venv
-```
-
-On Windows PowerShell, activate it:
+These are only used to generate the data from your terminal.
 
 ```powershell
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-Install the dependencies:
-
-```bash
 pip install -r requirements.txt
 ```
 
-### 4. Generate the synthetic dataset
+### 4. Start the stack
+
+```bash
+docker compose up -d --build
+```
+
+This starts three containers:
+
+| Container                 | Role                   | Address               |
+| ------------------------- | ---------------------- | --------------------- |
+| `forecastguard-postgres`  | Database               | `localhost:5433`      |
+| `forecastguard-airflow`   | Pipeline orchestration | http://localhost:8081 |
+| `forecastguard-dashboard` | Monitoring dashboard   | http://localhost:8501 |
+
+Airflow generates a password for the `admin` user each time its container is
+created. To read it:
+
+```bash
+docker exec forecastguard-airflow cat /opt/airflow/simple_auth_manager_passwords.json.generated
+```
+
+### 5. Run the normal scenario
 
 ```bash
 python -m src.simulation.generate_data
 ```
 
-This generates:
-
-```text
-data/orders.csv
-```
-
-The generated dataset is intentionally excluded from Git because it can be
-reproduced locally from the simulation script.
-
-### 5. Start the infrastructure
-
-```bash
-docker compose up -d
-```
-
-Docker starts the PostgreSQL database and the Airflow environment.
-
-The Airflow UI is available at:
-
-```text
-http://localhost:8081
-```
-
-### 6. Run the normal pipeline
-
-Trigger the `forecastguard_pipeline` DAG from the Airflow UI.
+This creates 45 days of synthetic orders (about 1,000 per day) in
+`data/orders.csv`. Then trigger the `forecastguard_pipeline` DAG in Airflow.
 
 Expected result:
 
 ```text
-ingest_orders   → SUCCESS
-dbt_run         → SUCCESS
-dbt_test        → SUCCESS
-quality_check   → SUCCESS
-forecast        → SUCCESS
+ingest_orders        → success
+dbt_run              → success
+dbt_test             → success
+quality_check        → success (routes to forecast)
+forecast             → success
+assistant_diagnosis  → skipped
 ```
 
-### 7. Simulate a data quality anomaly
+The dashboard shows a published forecast.
 
-Run:
+### 6. Run the anomaly scenario
 
 ```bash
 python -m src.simulation.simulate_anomaly
 ```
 
-Then trigger the Airflow DAG again.
+This adds a new day with only 150 orders, against a usual volume of about
+1,040. Trigger the DAG again.
 
 Expected result:
 
 ```text
-ingest_orders        → SUCCESS
-dbt_run              → SUCCESS
-dbt_test             → SUCCESS
-quality_check        → FAILED
-forecast             → BLOCKED
-assistant_diagnosis  → SUCCESS
+ingest_orders        → success
+dbt_run              → success
+dbt_test             → success   (the data is well formed...)
+quality_check        → success   (...but too small: routes to diagnosis)
+forecast             → skipped
+assistant_diagnosis  → success
 ```
 
-The LLM assistant analyzes the detected anomaly and recommends relevant
-investigation steps.
+The dashboard shows a blocked forecast, the volume drop on the chart, and
+the diagnosis. To go back to normal data, run `generate_data` again.
 
-## Project Structure
+### 7. Inspect the run history
+
+```bash
+docker exec forecastguard-postgres psql -U forecastguard -d forecastguard -c "SELECT id, data_date, current_orders, volume_ratio, status, predicted_orders FROM forecast_runs;"
+```
+
+## Project structure
 
 ```text
 forecastguard/
 ├── airflow/
 │   └── dags/
-│       └── forecastguard_pipeline.py
+│       └── forecastguard_pipeline.py   # DAG with the quality branch
+├── dashboard/
+│   └── app.py                          # Streamlit dashboard
 ├── dbt/
 │   └── forecastguard_dbt/
 │       ├── models/
-│       │   ├── staging/
-│       │   └── marts/
+│       │   ├── staging/                # source + stg_orders
+│       │   ├── marts/                  # fct_daily_sales
+│       │   └── schema.yml              # structural tests
 │       ├── dbt_project.yml
 │       └── profiles.yml
 ├── src/
-│   ├── ingestion/
-│   ├── quality/
-│   ├── forecasting/
-│   ├── assistant/
-│   └── simulation/
+│   ├── ingestion/                      # CSV → raw_orders
+│   ├── quality/                        # volume check
+│   ├── forecasting/                    # 7-day moving average
+│   ├── assistant/                      # Gemini diagnosis
+│   ├── storage/                        # forecast_runs table
+│   └── simulation/                     # normal and anomaly data
 ├── .env.example
-├── .gitignore
 ├── docker-compose.yml
 ├── Dockerfile.airflow
+├── Dockerfile.streamlit
 ├── requirements.txt
-└── requirements-airflow.txt
+├── requirements-airflow.txt
+└── requirements-dashboard.txt
 ```
 
-## Roadmap
+## Limitations and next steps
 
-ForecastGuard currently focuses on a reproducible local pipeline and a
-single volume-based data quality scenario.
+ForecastGuard is a local, single-scenario project. Its current limits, and
+what would come next in a production setting:
 
-Possible future improvements include:
-
-- additional quality checks for freshness, duplicates and schema changes
-- richer historical monitoring of data quality metrics
-- retrieval of runbooks and previous incidents to enrich LLM context
-- tool-using AI capabilities for deeper pipeline investigation
-- controlled remediation actions with validation and human approval
-- cloud warehouse deployment and CI/CD
+- **One quality check.** Only daily volume is checked. Next: freshness,
+  duplicates, and volume per product or per store.
+- **Full refresh ingestion.** All orders are reloaded on every run. With real
+  volumes, loading would be incremental.
+- **Manual trigger.** The DAG has no schedule. Next: a daily schedule and an
+  alert (email or Slack) when a forecast is blocked.
+- **Local Airflow.** `airflow standalone` keeps its metadata inside the
+  container, so run history in the Airflow UI is lost when the container is
+  recreated. The `forecast_runs` table is not affected.
+- **Credentials.** The dbt profile contains the database password. It should
+  read it from environment variables instead.
+- **Richer diagnosis.** Give the assistant past incidents and runbooks as
+  context, and let it run read-only queries to test its own hypotheses.
